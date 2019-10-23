@@ -1,0 +1,160 @@
+---
+title: "Route Optimization Algorithm"
+author: "Eric Bridgeford"
+date: "October 22, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+If you have not installed RBGL, it can be installed with Bioconductor:
+
+```{r, eval=FALSE, message=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("RBGL")
+```
+
+
+```{r, message=FALSE}
+require(tidyverse)
+require(ggplot2)
+require(ggmap)
+require(gmapsdistance)
+require(Rfast)
+require(RBGL)
+require(lubridate)
+
+sessionInfo()
+```
+
+
+NOTE: You need a google API key to knit this document. [This link](https://developers.google.com/maps/documentation/javascript/get-api-key#get-the-api-key) contains information for how to acquire a key. An API key is `csv` file is of the form:
+
+```
+Key
+<your-key>
+```
+
+with NO other information.
+
+```{r}
+API_KEY=read_csv('./key.csv', col_names = TRUE)$Key
+set.api.key(API_KEY)
+register_google(API_KEY)
+```
+
+We begin by loading the data, and subsetting a single zip code for a single day:
+
+```{r}
+dat.311 <- readRDS ('./311_data.rds') %>%
+  mutate(CreatedDate=as.POSIXct(as.character(CreatedDate), format="%m/%d/%Y %H:%M:%OS %p", tz="EST")) %>%
+  mutate(Month=month(CreatedDate), Year=year(CreatedDate), Day=day(CreatedDate))
+```
+
+```{r}
+getLatLng.by.Zip <- function(zip, max.attempt=10) {
+  r <- NULL
+  attempt <- 1
+  while( is.null(r) && attempt <= max.attempt ) {
+    attempt <- attempt + 1
+    try(
+      r <- geocode(location=as.character(zip), source="google")
+    )
+  }
+  return(r)
+}
+
+# a Function for generating a graph containing the pairwise distances between points
+make.dist <- function(addresses, zip.center) {
+  # get the latitude/longitude associated with the current zip code
+  zip.latlng <- getLatLng.by.Zip(zip.center)
+  # bing into appropriately formatted string
+  zip.latlng.str <- sprintf("(%s, %s)", zip.latlng$lat, zip.latlng$lon)
+  addresses <- c(zip.latlng.str, addresses)
+  addresses <- unique(addresses)
+  # format the addresses accordingly
+  addresses.fmt <- str_replace(str_remove_all(addresses, pattern="[)(]"), pattern=", ", replacement="+")
+  N <- length(addresses.fmt)
+  # compute all pairs distances btwn addresses
+  query <- gmapsdistance(addresses.fmt, addresses.fmt, mode="walking")
+  
+  # return a distance matrix
+  D <- as.matrix(as.data.frame(query$Distance)[, -1])
+  colnames(D) <- rownames(D) <- addresses
+  return(list(D=D, source=c(1, rep(0, length(addresses)-1)), addresses=addresses))
+}
+
+# takes a distance matrix, and runs the floyd-warshall algorithm to return the path
+# distances
+run.FW <- function(D) {
+  D.gr <- as(D, "graphNEL")
+  sp.lengths <- floyd.warshall.all.pairs.sp(D.gr)
+  return(sp.lengths)
+}
+
+# a function to compute an approximate shortest route
+# using a greedy nearest-neighbor approach
+compute.route <- function(addresses, zip.center) {
+  dist <- make.dist(addresses, zip.center)
+  D <- dist$D; is.visited <- dist$source
+  SP <- run.FW(D)
+  diag(SP) <- Inf  # so we don't visit same node sequentially
+  # traverse the graph sequentially starting at the bot hub
+  v.cur <- which(is.visited == 1)
+  path <- v.cur
+  
+  for (i in 1:(length(is.visited) - 1)) {
+    # get the shortest paths to the non-visited vertices
+    d.cur <- SP[v.cur,]
+    # remove current node from consideration
+    SP[v.cur,] <- SP[,v.cur] <- Inf
+    # find the closest node greedily
+    v.cur <- which(d.cur == min(d.cur))[1]
+    # mark that we have visited
+    is.visited[v.cur] <- TRUE
+    # append to the path
+    path <- c(path, as.numeric(v.cur))
+  }
+  return(list(addresses=dist$addresses, path=path))
+}
+```
+
+```{r}
+one.day <- dat.311 %>%
+  filter(ZipCode=="21213", Year=="2018", Month=="10", Day=="22", Agency=="Solid Waste")
+
+route.bot <- compute.route(as.character(one.day$GeoLocation), zip.center="21213")
+```
+
+# Example Route Plot
+
+```{r}
+rotate_left <- function(x, n = 1) {
+  if (n == 0) x else c(tail(x, -n), head(x, n))
+}
+
+addresses <- apply(as.matrix(str_split_fixed(str_remove_all(route.bot$addresses, pattern="[)(]"),
+                                             pattern=", ", n=2)), 2, as.numeric)
+address.df <- data.frame(latitude=addresses[,1], longitude=addresses[,2])
+next.path <- rotate_left(route.bot$path, 1)
+route.df <- data.frame(lat1=address.df$latitude[route.bot$path], long1=address.df$longitude[route.bot$path],
+                       lat2=address.df$latitude[next.path], long2=address.df$longitude[next.path])
+
+map <- get_map(location=c(left=min(address.df$longitude) - .005,
+                          right=max(address.df$longitude) + .005,
+                          bottom=min(address.df$latitude) - .005,
+                          top=max(address.df$latitude) + .005),
+               maptype="roadmap", source="google", color="color")
+
+ggmap(map) +
+  geom_point(data=address.df, aes(x=longitude, y=latitude), color="blue", size=2) +
+  geom_segment(data=route.df, aes(x=long1, y=lat1, xend=long2, yend=lat2)) +
+  geom_point(data=address.df[1,], aes(x=longitude, y=latitude), color="red", shape="diamond", size=6, fill="red") +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  ggtitle("Path for Mr. Trash Baby on 10/22/2018 in 21213")
+```
